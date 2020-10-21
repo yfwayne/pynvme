@@ -38,6 +38,7 @@ import time
 import pytest
 import struct
 import logging
+import warnings
 
 from nvme import *
 
@@ -210,6 +211,14 @@ class Command(object):
         self.buf[self.pos:] = struct.pack('>H', val)
         self.pos += 2
 
+    def append_u32(self, val):
+        self.buf[self.pos:] = struct.pack('>I', val)
+        self.pos += 4
+
+    def append_u64(self, val):
+        self.buf[self.pos:] = struct.pack('>Q', val)
+        self.pos += 8
+
     def append_token(self, token):
         self.append_u8(token)
 
@@ -225,7 +234,7 @@ class Command(object):
 
     def append_token_list(self, *val_list):
         for val in val_list:
-            self.append_u8(val)
+            self.append_u8(int(val))
 
     def append_token_atom(self, atom):
         if type(atom) == int:
@@ -240,9 +249,14 @@ class Command(object):
                 # short: 2-byte int
                 self.append_u8(0x82)
                 self.append_u16(atom)
+            elif atom < 0x100000000:
+                # medium: 4-byte int
+                self.append_u8(0x84)
+                self.append_u32(atom)
             else:
-                # TODO: medium and long atom
-                assert False
+                # long: 8-byte int
+                self.append_u8(0x88)
+                self.append_u64(atom)
         else:
             assert type(atom) == bytes
             if len(atom) < 16:
@@ -365,9 +379,162 @@ class Command(object):
         self.buf[24:] = struct.pack('>I', hsn)
         return self
 
-    def enable_user(self, hsn, tsn, user_id):
+    def setup_range(self, hsn, tsn, range, slba=0, nlb=0):
+        range_uid = opal_uid_table[OPAL_UID.LOCKINGRANGE_GLOBAL][:]
+        if range:  # not global
+            range_uid[5] = 3
+            range_uid[7] = range
+
         self.append_token(OPAL_TOKEN.CALL)
-        self.append_token_uid(OPAL_UID.USER1)  # TODO
+        self.append_u8(0xa0+len(range_uid))
+        self.append_token_list(*range_uid)
+        self.append_token_method(OPAL_METHOD.SET)
+        self.append_token_list(OPAL_TOKEN.STARTLIST,
+                               OPAL_TOKEN.STARTNAME,
+                               OPAL_TOKEN.VALUES,
+                               OPAL_TOKEN.STARTLIST)
+        
+        if range:
+            self.append_token_list(OPAL_TOKEN.STARTNAME,
+                                   OPAL_TOKEN.RANGESTART)
+            self.append_token_atom(slba)
+            self.append_token_list(OPAL_TOKEN.ENDNAME,
+                                   OPAL_TOKEN.STARTNAME,
+                                   OPAL_TOKEN.RANGELENGTH)
+            self.append_token_atom(nlb)
+            self.append_token_list(OPAL_TOKEN.ENDNAME)
+            
+        self.append_token_list(OPAL_TOKEN.STARTNAME,
+                               OPAL_TOKEN.READLOCKENABLED,
+                               OPAL_TOKEN.TRUE,
+                               OPAL_TOKEN.ENDNAME,
+                               OPAL_TOKEN.STARTNAME,
+                               OPAL_TOKEN.WRITELOCKENABLED,
+                               OPAL_TOKEN.TRUE,
+                               OPAL_TOKEN.ENDNAME,
+                               OPAL_TOKEN.ENDLIST,
+                               OPAL_TOKEN.ENDNAME,
+                               OPAL_TOKEN.ENDLIST)
+        self.buf[20:] = struct.pack('>I', tsn)
+        self.buf[24:] = struct.pack('>I', hsn)
+        return self
+
+    def gen_new_key(self, hsn, tsn, range, prev_data):
+        self.append_token(OPAL_TOKEN.CALL)
+        self.append_u8(0xa0+len(prev_data))
+        self.append_token_list(*prev_data)
+        self.append_token_method(OPAL_METHOD.GENKEY)
+        self.append_token_list(OPAL_TOKEN.STARTLIST, OPAL_TOKEN.ENDLIST)
+        self.buf[20:] = struct.pack('>I', tsn)
+        self.buf[24:] = struct.pack('>I', hsn)
+        return self
+
+    def get_active_key(self, hsn, tsn, range):
+        range_uid = opal_uid_table[OPAL_UID.LOCKINGRANGE_GLOBAL][:]
+        if range:  # not global
+            range_uid[5] = 3
+            range_uid[7] = range
+
+        self.append_token(OPAL_TOKEN.CALL)
+        self.append_u8(0xa0+len(range_uid))
+        self.append_token_list(*range_uid)
+        self.append_token_method(OPAL_METHOD.GET)
+        self.append_token_list(OPAL_TOKEN.STARTLIST,
+                               OPAL_TOKEN.STARTLIST,
+                               OPAL_TOKEN.STARTNAME,
+                               OPAL_TOKEN.STARTCOLUMN,
+                               OPAL_TOKEN.ACTIVEKEY,
+                               OPAL_TOKEN.ENDNAME,
+                               OPAL_TOKEN.STARTNAME,
+                               OPAL_TOKEN.ENDCOLUMN,
+                               OPAL_TOKEN.ACTIVEKEY,
+                               OPAL_TOKEN.ENDNAME,
+                               OPAL_TOKEN.ENDLIST,
+                               OPAL_TOKEN.ENDLIST)
+        self.buf[20:] = struct.pack('>I', tsn)
+        self.buf[24:] = struct.pack('>I', hsn)
+        return self
+
+    def lock_unlock_range(self, hsn, tsn, range, rlock, wlock):
+        range_uid = opal_uid_table[OPAL_UID.LOCKINGRANGE_GLOBAL][:]
+        if range:  # not global
+            range_uid[5] = 3
+            range_uid[7] = range
+
+        self.append_token(OPAL_TOKEN.CALL)
+        self.append_u8(0xa0+len(range_uid))
+        self.append_token_list(*range_uid)
+        self.append_token_method(OPAL_METHOD.SET)
+        self.append_token_list(OPAL_TOKEN.STARTLIST,
+                               OPAL_TOKEN.STARTNAME,
+                               OPAL_TOKEN.VALUES,
+                               OPAL_TOKEN.STARTLIST,
+                               OPAL_TOKEN.STARTNAME,
+                               OPAL_TOKEN.READLOCKED,
+                               rlock,
+                               OPAL_TOKEN.ENDNAME,
+                               OPAL_TOKEN.STARTNAME,
+                               OPAL_TOKEN.WRITELOCKED,
+                               wlock,
+                               OPAL_TOKEN.ENDNAME,
+                               OPAL_TOKEN.ENDLIST,
+                               OPAL_TOKEN.ENDNAME,
+                               OPAL_TOKEN.ENDLIST)
+        self.buf[20:] = struct.pack('>I', tsn)
+        self.buf[24:] = struct.pack('>I', hsn)
+        return self
+
+    def add_user_to_range(self, hsn, tsn, user, range, passwd, can_write=True):
+        user_uid = opal_uid_table[OPAL_UID.USER1][:]
+        user_uid[7] = user
+        range_uid = opal_uid_table[OPAL_UID.LOCKINGRANGE_ACE_RDLOCKED+can_write][:]
+        range_uid[7] = range
+        auth_ref_uid = opal_uid_table[OPAL_UID.HALF_AUTHORITY_OBJ_REF][:4]
+        boolean_ace_uid = opal_uid_table[OPAL_UID.HALF_BOOLEAN_ACE][:4]
+
+        self.append_token(OPAL_TOKEN.CALL)
+        self.append_u8(0xa0+len(range_uid))
+        self.append_token_list(*range_uid)
+        self.append_token_method(OPAL_METHOD.SET)
+        self.append_token_list(OPAL_TOKEN.STARTLIST,
+                               OPAL_TOKEN.STARTNAME,
+                               OPAL_TOKEN.VALUES,
+                               OPAL_TOKEN.STARTLIST,
+                               OPAL_TOKEN.STARTNAME,
+                               OPAL_TOKEN.BOOLEAN_EXPR,
+                               OPAL_TOKEN.STARTLIST,
+                               OPAL_TOKEN.STARTNAME)
+
+        self.append_u8(0xa0+len(auth_ref_uid))
+        self.append_token_list(*auth_ref_uid)
+        self.append_u8(0xa0+len(user_uid))
+        self.append_token_list(*user_uid)
+        self.append_token_list(OPAL_TOKEN.ENDNAME, OPAL_TOKEN.STARTNAME)
+        self.append_u8(0xa0+len(auth_ref_uid))
+        self.append_token_list(*auth_ref_uid)
+        self.append_u8(0xa0+len(user_uid))
+        self.append_token_list(*user_uid)
+        self.append_token_list(OPAL_TOKEN.ENDNAME, OPAL_TOKEN.STARTNAME)
+        self.append_u8(0xa0+len(boolean_ace_uid))
+        self.append_token_list(*boolean_ace_uid)
+        self.append_token_list(OPAL_TOKEN.TRUE,
+                               OPAL_TOKEN.ENDNAME,
+                               OPAL_TOKEN.ENDLIST,
+                               OPAL_TOKEN.ENDNAME,
+                               OPAL_TOKEN.ENDLIST,
+                               OPAL_TOKEN.ENDNAME,
+                               OPAL_TOKEN.ENDLIST)
+        self.buf[20:] = struct.pack('>I', tsn)
+        self.buf[24:] = struct.pack('>I', hsn)
+        return self
+
+    def enable_user(self, hsn, tsn, user_id):
+        user_uid = opal_uid_table[OPAL_UID.USER1][:]
+        user_uid[7] = user_id
+
+        self.append_token(OPAL_TOKEN.CALL)
+        self.append_u8(0xa0+len(user_uid))
+        self.append_token_list(*user_uid)
         self.append_token_method(OPAL_METHOD.SET)
         self.append_token_list(OPAL_TOKEN.STARTLIST,
                                OPAL_TOKEN.STARTNAME,
@@ -460,10 +627,62 @@ class Response(object):
         self.nvme0 = nvme0
         self.comid = comid
         self.buf = Buffer(2048, "TCG Response Buffer")
+        self.parsed = []
 
-    def receive(self):
+    def receive(self, check_status=True):
         self.nvme0.security_receive(self.buf, self.comid).waitdone()
-        logging.debug(self.buf.dump(128))
+        logging.debug(self.buf.dump(256))
+
+        def _parse_token(ptr, len, bytes):
+            if bytes:
+                # byte sequence
+                self.parsed.append(self.buf[ptr+1:ptr+1+len])
+            else:
+                # int
+                if len == 2:
+                    pattern = ">H"
+                elif len == 4:
+                    pattern = ">I"
+                else:
+                    logging.info(len)
+                    assert False
+                l = struct.unpack(pattern, self.buf[ptr+1:ptr+1+len])
+                self.parsed.append(l[0])
+
+        # parse the buffer
+        ptr = 0x38
+        _size = struct.unpack(">H", self.buf[0x36:0x38])[0]
+        while ptr < 0x38+_size:
+            ch = self.buf.data(ptr)
+
+            if ch < 0x80:
+                # tiny
+                self.parsed.append(ch)
+            elif ch >= 0x80 and ch < 0xc0:
+                # short atom
+                _len = ch & 0xf
+                _parse_token(ptr, _len, ch & 0x20)
+                ptr += _len
+            elif ch >= 0xc0 and ch < 0xe0:
+                # medium
+                _len = ((ch & 7) << 8)+self.buf.data(ptr+1)
+                ptr += 1
+                _parse_token(ptr, _len, ch & 0x10)
+                ptr += _len
+            elif ch >= 0xe0 and ch < 0xe4:
+                # medium
+                _len = self.buf.data(ptr+1, ptr+4)
+                ptr += 3
+                _parse_token(ptr, _len, ch & 0x2)
+                ptr += _len
+
+            ptr += 1
+
+        # check status
+        logging.debug(self.parsed)
+        if check_status and len(self.parsed) >= 3:
+            if self.parsed[-3]:
+                warnings.warn("TCG response error: "+str(self.parsed))
         return self
 
     def level0_discovery(self):
@@ -489,16 +708,15 @@ class Response(object):
         return comid
 
     def start_session(self):
-        hsn = struct.unpack(">I", self.buf[0x4d:0x51])
-        tsn = struct.unpack(">I", self.buf[0x52:0x56])
-        return hsn[0], tsn[0]
+        return self.parsed[2], self.parsed[3]
 
     def get_c_pin_msid(self):
-        length = struct.unpack(">B", self.buf[0x3d:0x3e])[0]
-        return self.buf[0x3e:0x3e+length]
+        length = struct.unpack(">B", self.buf[0x3c:0x3d])[0]
+        length = length & 0xf
+        return self.parsed[1]
 
-    def get_locking_sp_lifecycle(self):
-        return
+    def get_active_key(self):
+        return self.parsed[1]
 
 
 def test_properties(nvme0):
@@ -510,76 +728,178 @@ def test_properties(nvme0):
         b"MaxSubPackets": 1,
         b"MaxMethods": 1,
     }
-    comid = Response(nvme0).receive().level0_discovery()
+    comid = Response(nvme0).receive(False).level0_discovery()
     Command(nvme0, comid).properties().send()
-    Response(nvme0, comid).receive()
+    Response(nvme0, comid).receive(False)
     Command(nvme0, comid).properties(host_properties).send()
-    Response(nvme0, comid).receive()
+    Response(nvme0, comid).receive(False)
 
 
-def test_take_ownership_and_revert_tper(subsystem, nvme0, new_passwd=b'123456'):
+def test_tcg_user_range(subsystem, nvme0, nvme0n1, qpair, buf, new_passwd=b'123456'):
     # subsystem.power_cycle()
     # nvme0.reset()
 
-    comid = Response(nvme0).receive().level0_discovery()
+    nvme0n1.write(qpair, buf, 0).waitdone()
+    nvme0n1.write(qpair, buf, 128).waitdone()
+    nvme0n1.read(qpair, buf, 0).waitdone()
+    nvme0n1.read(qpair, buf, 128).waitdone()
 
-    # take ownership
-    Command(nvme0, comid).start_anybody_adminsp_session(0x65).send()
+    comid = Response(nvme0).receive(False).level0_discovery()
+
+    logging.info("test: take ownership")
+    Command(nvme0, comid).start_anybody_adminsp_session(0x69).send()
     hsn, tsn = Response(nvme0, comid).receive().start_session()
+    logging.debug("hsn 0x%x, tsn 0x%x" % (hsn, tsn))
     Command(nvme0, comid).get_msid_cpin_pin(hsn, tsn).send()
     password = Response(nvme0, comid).receive().get_c_pin_msid()
     Command(nvme0, comid).end_session(hsn, tsn).send(False)
     Response(nvme0, comid).receive()
+    nvme0n1.read(qpair, buf, 0).waitdone()
 
-    # set password
-    Command(nvme0, comid).start_adminsp_session(0x66, password).send()
+    logging.info("test: set password")
+    Command(nvme0, comid).start_adminsp_session(0x69, password).send()
     hsn, tsn = Response(nvme0, comid).receive().start_session()
     Command(nvme0, comid).set_sid_cpin_pin(hsn, tsn, new_passwd).send()
     Response(nvme0, comid).receive()
     Command(nvme0, comid).end_session(hsn, tsn).send(False)
     Response(nvme0, comid).receive()
 
-    # activate locking sp
-    Command(nvme0, comid).start_adminsp_session(0x66, new_passwd).send()
+    logging.info("test: activate locking sp")
+    Command(nvme0, comid).start_adminsp_session(0x69, new_passwd).send()
     hsn, tsn = Response(nvme0, comid).receive().start_session()
     Command(nvme0, comid).get_locking_sp_lifecycle(hsn, tsn).send()
-    Response(nvme0, comid).receive().get_locking_sp_lifecycle()
+    Response(nvme0, comid).receive()
     Command(nvme0, comid).activate(hsn, tsn).send()
     Response(nvme0, comid).receive()
     Command(nvme0, comid).end_session(hsn, tsn).send(False)
     Response(nvme0, comid).receive()
+    nvme0n1.read(qpair, buf, 0).waitdone()
 
-    # enable user
-    Command(nvme0, comid).start_adminsp_session(0x66, new_passwd).send()
+    logging.info("test: setup range")
+    Command(nvme0, comid).start_auth_session(0x69, 0, new_passwd).send()
+    hsn, tsn = Response(nvme0, comid).receive().start_session()
+    Command(nvme0, comid).setup_range(hsn, tsn, 1, 0, 128).send()
+    Response(nvme0, comid).receive()
+    Command(nvme0, comid).end_session(hsn, tsn).send(False)
+    Response(nvme0, comid).receive()
+    nvme0n1.read(qpair, buf, 0).waitdone()
+
+    logging.info("test: enable user")
+    Command(nvme0, comid).start_auth_session(0x69, 0, new_passwd).send()
     hsn, tsn = Response(nvme0, comid).receive().start_session()
     Command(nvme0, comid).enable_user(hsn, tsn, 1).send()
     Response(nvme0, comid).receive()
     Command(nvme0, comid).end_session(hsn, tsn).send(False)
     Response(nvme0, comid).receive()
+    nvme0n1.read(qpair, buf, 0).waitdone()
 
-    # change passwd
-    Command(nvme0, comid).start_adminsp_session(0x66, new_passwd).send()
+    logging.info("test: change passwd")
+    Command(nvme0, comid).start_auth_session(0x69, 0, new_passwd).send()
     hsn, tsn = Response(nvme0, comid).receive().start_session()
     Command(nvme0, comid).set_new_passwd(hsn, tsn, 1, b"654321").send()
     Response(nvme0, comid).receive()
     Command(nvme0, comid).end_session(hsn, tsn).send(False)
     Response(nvme0, comid).receive()
 
-    # user session
-    Command(nvme0, comid).start_auth_session(0x66, 1, b"654321").send()
+    logging.info("test: user session")
+    Command(nvme0, comid).start_auth_session(0x69, 1, b"654321").send()
     hsn, tsn = Response(nvme0, comid).receive().start_session()
     Command(nvme0, comid).set_new_passwd(hsn, tsn, 1, b"111111").send()
     Response(nvme0, comid).receive()
     Command(nvme0, comid).end_session(hsn, tsn).send(False)
     Response(nvme0, comid).receive()
+    nvme0n1.read(qpair, buf, 0).waitdone()
 
-    # auth admin session
-    Command(nvme0, comid).start_auth_session(0x66, 0, new_passwd).send()
+    logging.info("test: add user to range, readonly")
+    Command(nvme0, comid).start_auth_session(0x69, 0, new_passwd).send()
     hsn, tsn = Response(nvme0, comid).receive().start_session()
+    Command(nvme0, comid).add_user_to_range(hsn, tsn, 1, 1, new_passwd, False).send()
+    Response(nvme0, comid).receive()
     Command(nvme0, comid).end_session(hsn, tsn).send(False)
     Response(nvme0, comid).receive()
+    nvme0n1.read(qpair, buf, 0).waitdone()
 
-    # revert
+    logging.info("test: add user to range, readwrite")
+    Command(nvme0, comid).start_auth_session(0x69, 0, new_passwd).send()
+    hsn, tsn = Response(nvme0, comid).receive().start_session()
+    Command(nvme0, comid).add_user_to_range(hsn, tsn, 1, 1, new_passwd, True).send()
+    Response(nvme0, comid).receive()
+    Command(nvme0, comid).end_session(hsn, tsn).send(False)
+    Response(nvme0, comid).receive()
+    nvme0n1.read(qpair, buf, 0).waitdone()
+
+    logging.info("test: unlock range, none")
+    Command(nvme0, comid).start_auth_session(0x69, 1, b"111111").send()
+    hsn, tsn = Response(nvme0, comid).receive().start_session()
+    Command(nvme0, comid).lock_unlock_range(hsn, tsn, 1, True, True).send()
+    Response(nvme0, comid).receive()
+    Command(nvme0, comid).end_session(hsn, tsn).send(False)
+    Response(nvme0, comid).receive()
+    with pytest.warns(UserWarning, match="ERROR status: 02/86"):
+        nvme0n1.read(qpair, buf, 0).waitdone()
+    nvme0n1.read(qpair, buf, 128).waitdone()
+    with pytest.warns(UserWarning, match="ERROR status: 02/86"):
+        nvme0n1.write(qpair, buf, 0).waitdone()
+    nvme0n1.write(qpair, buf, 128).waitdone()
+
+    logging.info("test: unlock range, write only")
+    Command(nvme0, comid).start_auth_session(0x69, 1, b"111111").send()
+    hsn, tsn = Response(nvme0, comid).receive().start_session()
+    Command(nvme0, comid).lock_unlock_range(hsn, tsn, 1, True, False).send()
+    Response(nvme0, comid).receive()
+    Command(nvme0, comid).end_session(hsn, tsn).send(False)
+    Response(nvme0, comid).receive()
+    with pytest.warns(UserWarning, match="ERROR status: 02/86"):
+        nvme0n1.read(qpair, buf, 0).waitdone()
+    nvme0n1.read(qpair, buf, 128).waitdone()
+    nvme0n1.write(qpair, buf, 0).waitdone()
+    nvme0n1.write(qpair, buf, 128).waitdone()
+
+    logging.info("test: unlock range, read only")
+    Command(nvme0, comid).start_auth_session(0x69, 1, b"111111").send()
+    hsn, tsn = Response(nvme0, comid).receive().start_session()
+    Command(nvme0, comid).lock_unlock_range(hsn, tsn, 1, False, True).send()
+    Response(nvme0, comid).receive()
+    Command(nvme0, comid).end_session(hsn, tsn).send(False)
+    Response(nvme0, comid).receive()
+    nvme0n1.read(qpair, buf, 0).waitdone()
+    nvme0n1.read(qpair, buf, 128).waitdone()
+    with pytest.warns(UserWarning, match="ERROR status: 02/86"):
+        nvme0n1.write(qpair, buf, 0).waitdone()
+    nvme0n1.write(qpair, buf, 128).waitdone()
+
+    logging.info("test: unlock range, read/write")
+    Command(nvme0, comid).start_auth_session(0x69, 1, b"111111").send()
+    hsn, tsn = Response(nvme0, comid).receive().start_session()
+    Command(nvme0, comid).lock_unlock_range(hsn, tsn, 1, False, False).send()
+    Response(nvme0, comid).receive()
+    Command(nvme0, comid).end_session(hsn, tsn).send(False)
+    Response(nvme0, comid).receive()
+    nvme0n1.write(qpair, buf, 0).waitdone()
+    nvme0n1.write(qpair, buf, 1).waitdone()
+    nvme0n1.write(qpair, buf, 128).waitdone()
+    nvme0n1.read(qpair, buf, 0).waitdone()
+    logging.info(buf.dump(16))
+    nvme0n1.read(qpair, buf, 1).waitdone()
+    logging.info(buf.dump(16))
+    nvme0n1.read(qpair, buf, 128).waitdone()
+    logging.info(buf.dump(16))
+
+    logging.info("test: erase range")
+    Command(nvme0, comid).start_auth_session(0x69, 0, new_passwd).send()
+    hsn, tsn = Response(nvme0, comid).receive().start_session()
+    Command(nvme0, comid).get_active_key(hsn, tsn, 1).send()
+    prev_data = Response(nvme0, comid).receive().get_active_key()
+    Command(nvme0, comid).gen_new_key(hsn, tsn, 1, prev_data).send()
+    Response(nvme0, comid).receive()
+    Command(nvme0, comid).end_session(hsn, tsn).send(False)
+    Response(nvme0, comid).receive()
+    nvme0n1.read(qpair, buf, 1).waitdone()
+    logging.info(buf.dump(16))
+    nvme0n1.read(qpair, buf, 128).waitdone()
+    logging.info(buf.dump(16))
+
+    logging.info("test: revert")
     orig_timeout = nvme0.timeout
     nvme0.timeout = 100000
     Command(nvme0, comid).start_adminsp_session(0x69, new_passwd).send()
@@ -588,3 +908,129 @@ def test_take_ownership_and_revert_tper(subsystem, nvme0, new_passwd=b'123456'):
     Response(nvme0, comid).receive()
     # No "end session" for revert tper
     nvme0.timeout = orig_timeout
+    nvme0n1.read(qpair, buf, 1).waitdone()
+    logging.info(buf.dump(16))
+    nvme0n1.read(qpair, buf, 128).waitdone()
+    logging.info(buf.dump(16))
+
+
+def test_tcg_admin_global(subsystem, nvme0, nvme0n1, qpair, buf, new_passwd=b'123456'):
+    # subsystem.power_cycle()
+    # nvme0.reset()
+
+    nvme0n1.write(qpair, buf, 0).waitdone()
+    nvme0n1.write(qpair, buf, 128).waitdone()
+    nvme0n1.read(qpair, buf, 0).waitdone()
+    nvme0n1.read(qpair, buf, 128).waitdone()
+
+    comid = Response(nvme0).receive(False).level0_discovery()
+
+    logging.info("test: take ownership")
+    Command(nvme0, comid).start_anybody_adminsp_session(0x69).send()
+    hsn, tsn = Response(nvme0, comid).receive().start_session()
+    logging.debug("hsn 0x%x, tsn 0x%x" % (hsn, tsn))
+    Command(nvme0, comid).get_msid_cpin_pin(hsn, tsn).send()
+    password = Response(nvme0, comid).receive().get_c_pin_msid()
+    Command(nvme0, comid).end_session(hsn, tsn).send(False)
+    Response(nvme0, comid).receive()
+    nvme0n1.read(qpair, buf, 0).waitdone()
+
+    logging.info("test: set password")
+    Command(nvme0, comid).start_adminsp_session(0x69, password).send()
+    hsn, tsn = Response(nvme0, comid).receive().start_session()
+    Command(nvme0, comid).set_sid_cpin_pin(hsn, tsn, new_passwd).send()
+    Response(nvme0, comid).receive()
+    Command(nvme0, comid).end_session(hsn, tsn).send(False)
+    Response(nvme0, comid).receive()
+
+    logging.info("test: activate locking sp")
+    Command(nvme0, comid).start_adminsp_session(0x69, new_passwd).send()
+    hsn, tsn = Response(nvme0, comid).receive().start_session()
+    Command(nvme0, comid).get_locking_sp_lifecycle(hsn, tsn).send()
+    Response(nvme0, comid).receive()
+    Command(nvme0, comid).activate(hsn, tsn).send()
+    Response(nvme0, comid).receive()
+    Command(nvme0, comid).end_session(hsn, tsn).send(False)
+    Response(nvme0, comid).receive()
+    nvme0n1.read(qpair, buf, 0).waitdone()
+
+    logging.info("test: setup range global")
+    Command(nvme0, comid).start_auth_session(0x69, 0, new_passwd).send()
+    hsn, tsn = Response(nvme0, comid).receive().start_session()
+    Command(nvme0, comid).setup_range(hsn, tsn, 0).send()
+    Response(nvme0, comid).receive()
+    Command(nvme0, comid).end_session(hsn, tsn).send(False)
+    Response(nvme0, comid).receive()
+    nvme0n1.read(qpair, buf, 0).waitdone()
+    
+    logging.info("test: unlock range, none")
+    Command(nvme0, comid).start_auth_session(0x69, 0, new_passwd).send()
+    hsn, tsn = Response(nvme0, comid).receive().start_session()
+    Command(nvme0, comid).lock_unlock_range(hsn, tsn, 0, True, True).send()
+    Response(nvme0, comid).receive()
+    Command(nvme0, comid).end_session(hsn, tsn).send(False)
+    Response(nvme0, comid).receive()
+    with pytest.warns(UserWarning, match="ERROR status: 02/86"):
+        nvme0n1.read(qpair, buf, 0).waitdone()
+    with pytest.warns(UserWarning, match="ERROR status: 02/86"):
+        nvme0n1.read(qpair, buf, 128).waitdone()
+    with pytest.warns(UserWarning, match="ERROR status: 02/86"):
+        nvme0n1.write(qpair, buf, 0).waitdone()
+    with pytest.warns(UserWarning, match="ERROR status: 02/86"):
+        nvme0n1.write(qpair, buf, 128).waitdone()
+
+    logging.info("test: unlock range, readonly")
+    Command(nvme0, comid).start_auth_session(0x69, 0, new_passwd).send()
+    hsn, tsn = Response(nvme0, comid).receive().start_session()
+    Command(nvme0, comid).lock_unlock_range(hsn, tsn, 0, False, True).send()
+    Response(nvme0, comid).receive()
+    Command(nvme0, comid).end_session(hsn, tsn).send(False)
+    Response(nvme0, comid).receive()
+    nvme0n1.read(qpair, buf, 0).waitdone()
+    nvme0n1.read(qpair, buf, 128).waitdone()
+    with pytest.warns(UserWarning, match="ERROR status: 02/86"):
+        nvme0n1.write(qpair, buf, 0).waitdone()
+    with pytest.warns(UserWarning, match="ERROR status: 02/86"):
+        nvme0n1.write(qpair, buf, 128).waitdone()
+
+    logging.info("test: unlock range, write only")
+    Command(nvme0, comid).start_auth_session(0x69, 0, new_passwd).send()
+    hsn, tsn = Response(nvme0, comid).receive().start_session()
+    Command(nvme0, comid).lock_unlock_range(hsn, tsn, 0, True, False).send()
+    Response(nvme0, comid).receive()
+    Command(nvme0, comid).end_session(hsn, tsn).send(False)
+    Response(nvme0, comid).receive()
+    with pytest.warns(UserWarning, match="ERROR status: 02/86"):
+        nvme0n1.read(qpair, buf, 0).waitdone()
+    with pytest.warns(UserWarning, match="ERROR status: 02/86"):
+        nvme0n1.read(qpair, buf, 128).waitdone()
+    nvme0n1.write(qpair, buf, 0).waitdone()
+    nvme0n1.write(qpair, buf, 128).waitdone()
+        
+    logging.info("test: unlock range, read write")
+    Command(nvme0, comid).start_auth_session(0x69, 0, new_passwd).send()
+    hsn, tsn = Response(nvme0, comid).receive().start_session()
+    Command(nvme0, comid).lock_unlock_range(hsn, tsn, 0, False, False).send()
+    Response(nvme0, comid).receive()
+    Command(nvme0, comid).end_session(hsn, tsn).send(False)
+    Response(nvme0, comid).receive()
+    nvme0n1.write(qpair, buf, 0, 8).waitdone()
+    nvme0n1.write(qpair, buf, 128, 8).waitdone()
+    nvme0n1.read(qpair, buf, 1).waitdone()
+    assert buf[0] == 1
+    nvme0n1.read(qpair, buf, 128).waitdone()
+    assert buf[0] == 128
+        
+    logging.info("test: revert")
+    orig_timeout = nvme0.timeout
+    nvme0.timeout = 100000
+    Command(nvme0, comid).start_adminsp_session(0x69, new_passwd).send()
+    hsn, tsn = Response(nvme0, comid).receive().start_session()
+    Command(nvme0, comid).revert_tper(hsn, tsn).send()
+    Response(nvme0, comid).receive()
+    # No "end session" for revert tper
+    nvme0.timeout = orig_timeout
+    nvme0n1.read(qpair, buf, 1).waitdone()
+    assert buf[0] == 0
+    nvme0n1.read(qpair, buf, 128).waitdone()
+    assert buf[0] == 0

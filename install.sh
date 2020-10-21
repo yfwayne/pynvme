@@ -38,7 +38,10 @@ if [ -s /etc/redhat-release ]; then
     sudo yum install -y make redhat-rpm-config python3-devel python3-pip python3-tkinter
 elif [ -f /etc/debian_version ]; then
     # ubuntu
-    sudo apt install -y python3-setuptools python3-dev python3-pip
+    sudo apt install -y python3-setuptools python3-dev python3-pip python3-tk
+elif [ -f /etc/SUSE-brand ]; then
+    # SUSE
+    sudo zypper install -y python3-setuptools python3-devel python3-pip python3-tk
 else
     echo "unknown system type."
     exit 1
@@ -54,7 +57,7 @@ sudo python3 -m pip install -r requirements.txt
 
 # checkout and config pynvme code in SPDK and DPDK
 cd scripts/conformance && git checkout master && cd ../..
-cd spdk && git checkout pynvme_2.0
+cd spdk && git checkout pynvme_2.1
 cd dpdk && git checkout pynvme_2.0 && cd ..
 ./configure --without-isal && cd ..
 

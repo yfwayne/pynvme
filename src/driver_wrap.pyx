@@ -43,6 +43,7 @@
 
 # python package
 import os
+import gc
 import sys
 import time
 import glob
@@ -72,7 +73,7 @@ cimport cdriver as d
 
 # module informatoin
 __author__ = "Crane Chu"
-__version__ = "2.0"
+__version__ = "2.1.9"
 
 
 # nvme command timeout, it's a warning
@@ -226,7 +227,8 @@ cdef class Buffer(object):
     """
 
     cdef void* ptr
-    cdef size_t size
+    cdef size_t _size
+    cdef size_t prp_size
     cdef char* name
     cdef unsigned long phys_addr
     cdef unsigned int offset
@@ -243,7 +245,8 @@ cdef class Buffer(object):
         strncpy(self.name, name.encode('ascii'), len(name))
 
         # buffer init
-        self.size = size
+        self._size = size
+        self.prp_size = size
         self.offset = 0
         self.ptr = d.buffer_init(size, &self.phys_addr, ptype, pvalue)
         if self.ptr is NULL:
@@ -266,15 +269,20 @@ cdef class Buffer(object):
 
     @property
     def offset(self):
-        """get the offset of the PRP in bytes"""
-
         return self.offset
 
     @offset.setter
     def offset(self, offset):
-        """set the offset of the PRP in bytes"""
-
         self.offset = offset
+
+    @property
+    def size(self):
+        return self.prp_size
+
+    @size.setter
+    def size(self, size):
+        assert size <= self._size, "cannot be larger than physical size"
+        self.prp_size = size
 
     @property
     def phys_addr(self):
@@ -291,10 +299,10 @@ cdef class Buffer(object):
 
         base = 0
         output = self.name.decode('ascii')+'\n'
-        if self.ptr and self.size:
+        if self.ptr and self._size:
             # no size means print the whole buffer
-            if size is None or size > self.size:
-                size = self.size
+            if size is None or size > self._size:
+                size = self._size
 
             while size:
                 length = min(size, 4096)
@@ -326,7 +334,7 @@ cdef class Buffer(object):
             return str(self[byte_begin:byte_end+1], "ascii").rstrip()
 
     def __len__(self):
-        return self.size
+        return self._size
 
     def __repr__(self):
         return '<buffer name: %s>' % str(self.name, "ascii")
@@ -335,7 +343,7 @@ cdef class Buffer(object):
         if isinstance(index, slice):
             return bytes([self[i] for i in range(*index.indices(len(self)))])
         elif isinstance(index, int):
-            if index >= self.size:
+            if index >= self._size:
                 raise IndexError()
             return (<unsigned char*>self.ptr)[index]
         else:
@@ -347,7 +355,7 @@ cdef class Buffer(object):
             for i, d in enumerate(value):
                 self[i+start] = d
         elif isinstance(index, int):
-            if index >= self.size:
+            if index >= self._size:
                 raise IndexError()
             (<unsigned char*>self.ptr)[index] = value
         else:
@@ -400,7 +408,6 @@ cdef class Subsystem(object):
         """
 
         pcie = self._nvme.pcie
-        pcie.power_state = 3  # d3hot
         bdf = pcie._bdf.decode('utf-8')
 
         # cut power supply immediately without any delay
@@ -500,6 +507,7 @@ cdef class Subsystem(object):
             logging.warning("the controller does not supprt NSSR")
             return False
 
+        # nssr.nssrc: nvme subsystem reset
         logging.debug("nvme subsystem reset by NSSR.NSSRC")
         self._nvme[0x20] = 0x4e564d65  # "NVMe"
 
@@ -1173,7 +1181,7 @@ cdef class Controller(object):
                             cb_arg=<void*>cb)
         return self
 
-    def identify(self, buf, nsid=0, cns=1, cb=None):
+    def identify(self, buf, nsid=0, cns=1, cntid=0, csi=0, nvmsetid=0, cb=None):
         """identify admin command
 
         # Parameters
@@ -1190,8 +1198,8 @@ cdef class Controller(object):
 
         self.send_admin_raw(buf, 0x6,
                             nsid=nsid,
-                            cdw10=cns,
-                            cdw11=0,
+                            cdw10=(cntid << 16) | cns,
+                            cdw11=(csi << 24) | nvmsetid,
                             cdw12=0,
                             cdw13=0,
                             cdw14=0,
@@ -1299,7 +1307,7 @@ cdef class Controller(object):
         self.send_admin_raw(buf, 0x2,
                             nsid=nsid,
                             cdw10=((dwords & 0xffff) << 16) + lid,
-                            cdw11=dwords >> 16,
+                            cdw11=(dwords>>16) & 0xffff,
                             cdw12=offset,
                             cdw13=offset >> 32,
                             cdw14=0,
@@ -1949,7 +1957,7 @@ cdef class Namespace(object):
                  region_start=0, region_end=0xffffffffffffffff,
                  iops=0, io_count=0, lba_start=0, qprio=0,
                  distribution=None, ptype=0xbeef, pvalue=100,
-                 io_sequence=None,
+                 io_sequence=None, fw_debug=False, 
                  output_io_per_second=None,
                  output_percentile_latency=None,
                  output_cmdlog_list=None):
@@ -2055,7 +2063,7 @@ cdef class Namespace(object):
                          lba_start, lba_step, io_size,
                          lba_align, lba_random, region_start, region_end,
                          op_percentage, iops, io_count, time, qdepth, qprio,
-                         distribution, pvalue, ptype, io_sequence,
+                         distribution, pvalue, ptype, io_sequence, fw_debug, 
                          output_io_per_second,
                          output_percentile_latency,
                          output_cmdlog_list)
@@ -2298,6 +2306,25 @@ cdef class Namespace(object):
         assert ret == 0, "error in submitting read write commands: %d" % ret
         return ret
 
+    def zns_mgmt_receive(self, qpair, buf, slba=0, dwords=None, extended=True, state=0, partial=True, cb=None):
+        if dwords is None:  dwords = len(buf)>>2  # the same size of buffer
+        assert dwords > 0, "cannot read empty data"
+        
+        self.send_io_raw(qpair, buf, 0x7a, self._nsid,
+                         slba&0xffffffff, slba>>32,
+                         dwords-1,
+                         (partial<<16)+(state<<8)+extended, 0, 0, 
+                         cmd_cb, <void*>cb)
+        return qpair
+    
+    def zns_mgmt_send(self, qpair, buf, slba=0, action=0, all=False, cb=None):
+        self.send_io_raw(qpair, buf, 0x79, self._nsid,
+                         slba&0xffffffff, slba>>32,
+                         0, 
+                         (all<<8)+action, 0, 0, 
+                         cmd_cb, <void*>cb)
+        return qpair
+    
     def send_cmd(self, opcode, qpair, buf=None, nsid=1,
                  cdw10=0, cdw11=0, cdw12=0,
                  cdw13=0, cdw14=0, cdw15=0,
@@ -2373,7 +2400,7 @@ class _IOWorker(object):
                  lba_start, lba_step, lba_size,
                  lba_align, lba_random, region_start, region_end,
                  op_percentage, iops, io_count, time, qdepth, qprio,
-                 distribution, pvalue, ptype, io_sequence,
+                 distribution, pvalue, ptype, io_sequence, fw_debug, 
                  output_io_per_second,
                  output_percentile_latency,
                  output_cmdlog_list):
@@ -2391,7 +2418,7 @@ class _IOWorker(object):
                                      op_percentage,
                                      iops, io_count, time, qdepth, qprio,
                                      distribution, pvalue, ptype,
-                                     io_sequence,
+                                     io_sequence, fw_debug, 
                                      output_io_per_second,
                                      output_percentile_latency,
                                      output_cmdlog_list))
@@ -2400,6 +2427,7 @@ class _IOWorker(object):
         self.output_cmdlog_list = output_cmdlog_list
         self.op_counter = op_percentage
         self.p.daemon = True
+        self.fw_debug = fw_debug
 
     def start(self):
         """Start the worker's process"""
@@ -2503,6 +2531,13 @@ class _IOWorker(object):
                            (os.getpid(), childpid)):
             os.remove(f)
 
+        if self.fw_debug and error:
+            # assert and stop test when ioworker fail in debug mode
+            logging.info("force terminate with ioworker error %d" % error)
+            gc.collect()
+            os._exit(error)
+
+        logging.debug(rets)
         return rets
 
     def iops_consistency(self, slowest_percentage=99.9):
@@ -2527,7 +2562,7 @@ class _IOWorker(object):
                   lba_start, lba_step, lba_size, lba_align, lba_random,
                   region_start, region_end, op_percentage,
                   iops, io_count, seconds, qdepth, qprio,
-                  distribution, pvalue, ptype, io_sequence,
+                  distribution, pvalue, ptype, io_sequence, fw_debug, 
                   output_io_per_second,
                   output_percentile_latency,
                   output_cmdlog_list):
@@ -2732,32 +2767,33 @@ class _IOWorker(object):
                 while not rqueue.empty():
                     time.sleep(1)
 
-            with locker:
-                # close resources in right order
-                if 'qpair' in locals():
-                    # fail fast to delete queue after power loss
-                    orig = nvme0.timeout
-                    if d.driver_config_read() & 0x10:
-                        nvme0.timeout = 10
-                        # backup BAR and remap to another memory
-                        d.nvme_bar_remap(nvme0.pcie._ctrlr)
+            if not fw_debug or not error:
+                with locker:
+                    # close resources in right order
+                    if 'qpair' in locals():
+                        # fail fast to delete queue after power loss
+                        orig = nvme0.timeout
+                        if d.driver_config_read() & 0x10:
+                            nvme0.timeout = 10
+                            # backup BAR and remap to another memory
+                            d.nvme_bar_remap(nvme0.pcie._ctrlr)
 
-                    try:
-                        qpair.delete()
-                    except:
-                        pass
+                        try:
+                            qpair.delete()
+                        except:
+                            pass
 
-                    # use original timeout
-                    if d.driver_config_read() & 0x10:
-                        nvme0.timeout = orig
-                        # use original BAR
-                        d.nvme_bar_recover(nvme0.pcie._ctrlr)
+                        # use original timeout
+                        if d.driver_config_read() & 0x10:
+                            nvme0.timeout = orig
+                            # use original BAR
+                            d.nvme_bar_recover(nvme0.pcie._ctrlr)
 
-                if 'nvme0n1' in locals():
-                    nvme0n1.close()
+                    if 'nvme0n1' in locals():
+                        nvme0n1.close()
 
-                if 'pcie' in locals():
-                    pcie.close()
+                    if 'pcie' in locals():
+                        pcie.close()
 
             if args.io_sequence:
                 PyMem_Free(args.io_sequence)
@@ -2789,7 +2825,7 @@ class _IOWorker(object):
             if args.op_counter:
                 PyMem_Free(args.op_counter)
 
-            import gc; gc.collect()
+            gc.collect()
 
 
 def srand(seed):

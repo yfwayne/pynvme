@@ -1,3 +1,39 @@
+#
+#  BSD LICENSE
+#
+#  Copyright (c) Crane Chu <cranechu@gmail.com>
+#  All rights reserved.
+#
+#  Redistribution and use in source and binary forms, with or without
+#  modification, are permitted provided that the following conditions
+#  are met:
+#
+#    * Redistributions of source code must retain the above copyright
+#      notice, this list of conditions and the following disclaimer.
+#    * Redistributions in binary form must reproduce the above copyright
+#      notice, this list of conditions and the following disclaimer in
+#      the documentation and/or other materials provided with the
+#      distribution.
+#    * Neither the name of Intel Corporation nor the names of its
+#      contributors may be used to endorse or promote products derived
+#      from this software without specific prior written permission.
+#
+#  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+#  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+#  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+#  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+#  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+#  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+#  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+#  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+#  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+#  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+#  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+# -*- coding: utf-8 -*-
+
+
+import time
 import pytest
 import nvme as d
 
@@ -19,7 +55,7 @@ def do_ioworker(rand, read, ns):
 
     r = ns.ioworker(io_size=io_size, lba_align=io_size,
                     region_end=(1<<30)//512, # 1GB space
-                    lba_random=rand, qdepth=512,
+                    lba_random=rand, qdepth=64,
                     read_percentage=rp, time=seconds).start().close()
 
     io_total = r.io_count_read+r.io_count_nonread
@@ -28,16 +64,35 @@ def do_ioworker(rand, read, ns):
     return iops if rand else iops*io_size*512  # return Bps for seq IO
 
 
-def do_fill_drive(rand, nvme0n1):
+def do_fill_drive(rand, nvme0n1, nvme0, filename):
     io_size = 8 if rand else 128
     ns_size = nvme0n1.id_data(7, 0)
     io_count = ns_size//io_size
     io_per_second = []
+    output_percentile_latency = dict.fromkeys([99.9])
     
-    r = nvme0n1.ioworker(io_size=io_size, lba_align=io_size,
-                         lba_random=rand, qdepth=512,
+    w = nvme0n1.ioworker(io_size=io_size, lba_align=io_size,
+                         lba_random=rand, qdepth=64,
                          io_count=io_count, read_percentage=0,
-                         output_io_per_second=io_per_second).start().close()
+                         output_percentile_latency=output_percentile_latency,
+                         output_io_per_second=io_per_second).start()
+    while w.running:
+        nvme0.getfeatures(7).waitdone()
+        time.sleep(1)
+    r = w.close()
+    
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(30, 12))
+    plt.plot(r.latency_distribution)
+    plt.xlabel('useconds')
+    plt.ylabel('#IO')
+    plt.xlim(1, len(r.latency_distribution))
+    plt.ylim(bottom=1)
+    plt.xscale('log')
+    plt.yscale('log')
+    plt.tight_layout()
+    plt.savefig("lat_hist_"+filename+".png", dpi=300)
+    plt.close()
 
     if not rand:
         return [iops*io_size*512 for iops in io_per_second]
@@ -93,8 +148,8 @@ def test_1gb_read_write_performance(nvme0n1):
 
 
 # full drive seq write
-def test_fill_drive_first_pass(nvme0n1):
-    io_per_sec = do_fill_drive(seq, nvme0n1)
+def test_fill_drive_first_pass(nvme0, nvme0n1):
+    io_per_sec = do_fill_drive(seq, nvme0n1, nvme0, "first_seq")
     io_per_sec = io_per_sec[:300]
     with open("report.csv", "a") as f:
         for iops in io_per_sec:
@@ -103,8 +158,8 @@ def test_fill_drive_first_pass(nvme0n1):
             f.write('0\n')
     
 # random
-def test_fill_drive_random(nvme0n1, nvme0):
-    io_per_sec = do_fill_drive(rand, nvme0n1)
+def test_fill_drive_random(nvme0, nvme0n1):
+    io_per_sec = do_fill_drive(rand, nvme0n1, nvme0, "first_rand")
     io_per_sec = io_per_sec[:600]
     with open("report.csv", "a") as f:
         for iops in io_per_sec:
@@ -121,8 +176,8 @@ def test_fill_drive_random(nvme0n1, nvme0):
         
 # 2-pass full drive seq write
 @pytest.mark.parametrize("repeat", range(2))
-def test_fill_drive_after_random(nvme0n1, repeat):
-    io_per_sec = do_fill_drive(seq, nvme0n1)
+def test_fill_drive_after_random(nvme0, nvme0n1, repeat):
+    io_per_sec = do_fill_drive(seq, nvme0n1, nvme0, "seq_after_random_%d"%repeat)
     io_per_sec = io_per_sec[:600]
     with open("report.csv", "a") as f:
         for iops in io_per_sec:

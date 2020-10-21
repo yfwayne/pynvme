@@ -48,13 +48,13 @@ all: clean
 
 clean:
 	cd src; make clean
-	- sudo rm -rf  __pycache__ .pytest_cache cov_report .coverage.* a.out nvme.so nvme.*.so dist pynvme.egg-info build
+	- sudo rm -rf  __pycache__ .pytest_cache cov_report .coverage.* a.out nvme.so nvme.*.so dist pynvme.egg-info build report.xls
 	- sudo sh -c 'find . | grep -E "(__pycache__|\.pyc|\.pyo$$)" | xargs rm -rf'
 
 spdk:
 	cd spdk; make clean; ./configure --enable-debug --enable-log-bt --enable-werror --disable-tests --without-ocf --without-vhost --without-virtio --without-pmdk --without-vpp --without-rbd --without-isal; make -j8; cd ..
 
-doc:
+doc: all
 	pydocmd simple nvme++ > api.md
 	m2r api.md
 	mv api.rst doc
@@ -96,7 +96,7 @@ setup: reset
 	- sed -i 's/XXXX:BB:DD.F/${pciaddr}/g' .vscode/settings.json
 	sudo HUGEMEM=${memsize} DRIVER_OVERRIDE=uio_pci_generic ./src/setup.sh  	# UIO is recommended
 
-pypi:
+pypi: all
 	python3 setup.py sdist
 	python3 -m twine upload dist/*
 
@@ -104,7 +104,7 @@ tags:
 	ctags -e --c-kinds=+l -R --exclude=.git --exclude=ioat --exclude=snippets --exclude=env --exclude=doc
 
 pytest: info
-	sudo python3 -B -m pytest $(TESTS) --pciaddr=${pciaddr} -s -v -r Efsx
+	sudo python3 -B -m pytest $(TESTS) --pciaddr=${pciaddr} -s -v -r Efsx --excelreport=report.xls --verbose
 
 test:
 	- rm test_${pciaddr}.log
