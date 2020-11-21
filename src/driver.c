@@ -225,8 +225,6 @@ static inline int buffer_verify_lba(const void* buf,
         expected_lba != 0 &&
         expected_lba != (uint64_t)-1)
     {
-      SPDK_WARNLOG("lba mismatch: lba 0x%lx, but got: 0x%lx\n",
-                   lba, expected_lba);
       return -2;
     }
   }
@@ -264,7 +262,6 @@ static inline int buffer_verify_data(struct spdk_nvme_ns* ns,
       if (computed_crc != expected_crc)
       {
         assert(expected_crc != 0);  // exclude nomapping
-
         SPDK_WARNLOG("crc mismatch: lba 0x%lx, expected crc 0x%x, but got: 0x%x\n",
                      lba, expected_crc, computed_crc);
         return -3;
@@ -467,7 +464,7 @@ bool crc32_lock_lba(struct nvme_request* req)
   }
   else
   {
-    // other command like flush
+    // other no data command like flush
     return true;
   }
 
@@ -515,7 +512,7 @@ void crc32_unlock_lba(struct nvme_request* req)
   }
   else
   {
-    
+    // other no data command like flush
   }
 }
 
@@ -558,11 +555,11 @@ struct cmd_log_table_t {
   struct cmd_log_entry_t table[CMD_LOG_DEPTH];
   uint32_t head_index;
   uint32_t tail_index;
-  //uint32_t msg_data;
+  uint32_t latest_latency_us;
+  uint16_t latest_cid;
   uint16_t intr_vec;
   uint16_t intr_enabled;
-  uint16_t latest_cid;
-  uint16_t dummy[55];
+  uint16_t dummy[53];
 };
 static_assert(sizeof(struct cmd_log_table_t)%64 == 0, "cacheline aligned");
 
@@ -654,7 +651,7 @@ static void cmdlog_update_crc_io(struct spdk_nvme_cmd* cmd,
       case 9:
         //dsm
         assert(buf != NULL);
-        crc32_clear_ranges(ns, buf, cmd->cdw10+1);
+        crc32_clear_ranges(ns, buf, (cmd->cdw10&0xff)+1);
         break;
 
       default:
@@ -713,6 +710,18 @@ static int cmdlog_verify_crc(struct cmd_log_entry_t* log_entry)
         //verify data pattern and crc
         ret = buffer_verify_data(ns, log_entry->buf, lba, lba_count, lba_size);
       }
+      else
+      {
+        // lba wrong, verify crc with expected lba, instead of given lba
+        uint64_t expected_lba = *(uint64_t*)(log_entry->buf);
+        ret = buffer_verify_data(ns, log_entry->buf, expected_lba, lba_count, lba_size);
+        if (ret == 0)
+        {
+          // crc ok, so it is a real lba mismatch, mapping error
+          SPDK_WARNLOG("lba mismatch: lba 0x%lx, but got: 0x%lx\n", lba, expected_lba);
+          ret = -2;
+        }
+      }
     }
   }
 
@@ -725,6 +734,7 @@ void cmdlog_cmd_cpl(struct nvme_request* req, struct spdk_nvme_cpl* cpl)
   struct timeval diff;
   struct timeval now;
   struct cmd_log_entry_t* log_entry = req->cmdlog_entry;
+  struct cmd_log_table_t* cmdlog = req->qpair->pynvme_cmdlog;
 
   if (log_entry == NULL)
   {
@@ -748,6 +758,7 @@ void cmdlog_cmd_cpl(struct nvme_request* req, struct spdk_nvme_cpl* cpl)
   memcpy(&log_entry->cpl, cpl, sizeof(struct spdk_nvme_cpl));
   timersub(&now, &log_entry->time_cmd, &diff);
   log_entry->cpl_latency_us = timeval_to_us(&diff);
+  cmdlog->latest_latency_us = log_entry->cpl_latency_us;
 
   //update crc table when command completes successfully
   if (cpl->status.sc == 0 && cpl->status.sct == 0)
@@ -1263,6 +1274,22 @@ uint16_t qpair_get_latest_cid(struct spdk_nvme_qpair* q,
   assert(q->ctrlr == c);
   log_table = q->pynvme_cmdlog;
   return log_table->latest_cid;
+}
+
+uint32_t qpair_get_latest_latency(struct spdk_nvme_qpair* q,
+                                  struct spdk_nvme_ctrlr* c)
+{
+  struct cmd_log_table_t* log_table;
+
+  if (q == NULL)
+  {
+    q = c->adminq;
+  }
+
+  assert(q != NULL);
+  assert(q->ctrlr == c);
+  log_table = q->pynvme_cmdlog;
+  return log_table->latest_latency_us;
 }
 
 int qpair_free(struct spdk_nvme_qpair* q)
@@ -2029,7 +2056,8 @@ rpc_get_cmdlog(struct spdk_jsonrpc_request *request,
       {
         // a completed command, display its cpl cdws
         struct timeval time_cpl = (struct timeval){0};
-        time_cpl.tv_usec = table[index].cpl_latency_us;
+        time_cpl.tv_sec = table[index].cpl_latency_us/US_PER_S;
+        time_cpl.tv_usec = table[index].cpl_latency_us%US_PER_S;
         timeradd(&time_cmd, &time_cpl, &time_cpl);
 
         //get the string of cpl date/time

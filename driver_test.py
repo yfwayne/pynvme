@@ -244,8 +244,8 @@ def test_expected_dut(nvme0):
     logging.info("0x%x" % nvme0.id_data(3, 2))
     logging.info(nvme0.id_data(63, 24, str))
     logging.info(nvme0.id_data(71, 64, str))
-    assert nvme0.id_data(1, 0) == 0x14a4
-    assert "CAZ-82256-Q11" in nvme0.id_data(63, 24, str)
+    assert nvme0.id_data(1, 0) == 0x1e95
+    assert "CA5-8D256-Q11 NVMe SSSTC 256GB" in nvme0.id_data(63, 24, str)
 
 
 def test_read_fua_latency(nvme0n1, nvme0, qpair, buf):
@@ -406,6 +406,16 @@ def test_latest_cid(nvme0, nvme0n1, qpair, buf):
 
     nvme0n1.read(qpair, buf, 0, 8).waitdone()
     nvme0.abort(qpair.latest_cid).waitdone()
+
+    
+def test_latest_latency(nvme0, nvme0n1, qpair, buf):
+    nvme0n1.read(qpair, buf, 0, 8).waitdone()
+    logging.info(qpair.latest_latency)
+    nvme0n1.write(qpair, buf, 0, 8).waitdone()
+    logging.info(qpair.latest_latency)
+    for ps in range(5):
+        nvme0.setfeatures(0x2, cdw11=ps).waitdone()
+        logging.info(nvme0.latest_latency)
 
 
 def test_random_seed():
@@ -1174,9 +1184,14 @@ def test_ioworker_subsystem_reset_async(nvme0, nvme0n1, subsystem):
 
 
 def test_ioworker_controller_reset_async(nvme0n1, nvme0):
+    cmdlog_list = [None]*1000
     for i in range(10):
+        logging.info(i)
         start_time = time.time()
-        with nvme0n1.ioworker(io_size=8, time=100):
+        with nvme0n1.ioworker(io_size=8, lba_random=True,
+                              read_percentage=30,
+                              output_cmdlog_list=cmdlog_list,
+                              qdepth=8, time=100):
             time.sleep(3)
             nvme0.reset()
         # terminated by power cycle
@@ -1281,8 +1296,7 @@ def test_format_basic(nvme0, nvme0n1, lbaf):
     q = d.Qpair(nvme0, 8)
 
     logging.info("crypto secure erase one namespace")
-    with pytest.warns(UserWarning, match="ERROR status: 01/0a"):
-        nvme0.format(nvme0n1.get_lba_format(512, 0), ses=2).waitdone()
+    nvme0.format(nvme0n1.get_lba_format(512, 0), ses=2).waitdone()
 
     logging.info("invalid format")
     with pytest.warns(UserWarning, match="ERROR status:"):
@@ -1743,18 +1757,9 @@ def test_set_get_features(nvme0):
 
 
 def test_pcie_reset(nvme0, pcie, nvme0n1):
-    def get_power_cycles(nvme0):
-        buf = d.Buffer(512)
-        nvme0.getlogpage(2, buf, 512).waitdone()
-        ret = buf.data(115, 112)
-        logging.info("power cycles: %d" % ret)
-        return ret
-
     nvme0n1.ioworker(io_size=2, time=2).start().close()
-    powercycle = get_power_cycles(nvme0)
     pcie.reset()
     nvme0.reset()
-    assert powercycle == get_power_cycles(nvme0)
     nvme0n1.ioworker(io_size=2, time=2).start().close()
 
 
@@ -3534,9 +3539,10 @@ def test_fused_operations(nvme0, nvme0n1):
 
 
 def test_raw_write_read(nvme0, nvme0n1, qpair, verify):
-    buf = d.Buffer(512, ptype=32, pvalue=0x5aa5a55a)
-
+    assert verify == True
+    
     # use generic cmd to write without pynvme's injected data
+    buf = d.Buffer(512, ptype=32, pvalue=0x5aa5a55a)
     nvme0n1.send_cmd(1, qpair, buf).waitdone()  # write LBA 0
 
     with pytest.warns(UserWarning, match="ERROR status: 02/81"):
@@ -3755,3 +3761,23 @@ def test_ioworker_invalid_io_size_fw_debug_mode(nvme0, nvme0n1):
         nvme0n1.ioworker(io_size=nvme0.mdts//512+1, lba_align=64,
                          lba_random=False, qdepth=4,
                          read_percentage=100, time=2).start().close()
+
+
+from scripts.psd import IOCQ, IOSQ, PRP, PRPList, SQE, CQE
+
+def test_ioworker_with_invalid_sq_doorbell(nvme0, nvme0n1):
+    cq = IOCQ(nvme0, 4, 16, PRP())
+    sq1 = IOSQ(nvme0, 4, 16, PRP(), cqid=4)
+    
+    with nvme0n1.ioworker(io_size=8, io_count=1):
+        sq1.tail = 17
+
+    def _cb(cpl):
+        logging.info("getfeatures cb")
+        
+    with pytest.warns(UserWarning, match="AER notification is triggered"):
+        nvme0.getfeatures(7, cb=_cb).waitdone()
+        
+    sq1.delete()
+    cq.delete()
+    

@@ -73,7 +73,7 @@ cimport cdriver as d
 
 # module informatoin
 __author__ = "Crane Chu"
-__version__ = "2.1.9"
+__version__ = "2.2.0"
 
 
 # nvme command timeout, it's a warning
@@ -418,7 +418,7 @@ cdef class Subsystem(object):
         # cleanup host driver after power off, so IO is active at power off
         pcie._driver_cleanup()
         pcie._bind_driver(None)
-        subprocess.call('echo 1 > "/sys/bus/pci/devices/%s/remove" 2> /dev/null || true' % bdf, shell=True)
+        subprocess.call('echo 1 > "/sys/bus/pci/devices/%s/remove" 2> /dev/null' % bdf, shell=True)
 
         if not self._poweroff:
             self.power_cycle(15)
@@ -618,8 +618,8 @@ cdef class Pcie(object):
     def _driver_cleanup(self):
         # notify and wait all secondary processes to terminate
         if not d.driver_no_secondary(self._ctrlr):
-            self._config(ioworker_terminate=True)
             logging.info("wait all qpair to be deleted")
+            self._config(ioworker_terminate=True)
             d.crc32_unlock_all(self._ctrlr)
             retry = 100
             while not d.driver_no_secondary(self._ctrlr):
@@ -684,7 +684,22 @@ cdef class Pcie(object):
 
         logging.info("cannot find the capability %d" % cap_id)
 
-    def _rescan(self, retry=1000):
+    def _exist(self, filename, rescan=False, retry=1000):
+        logging.debug("check device file: %s" % filename)
+        while not os.path.exists(filename):
+            retry -= 1
+            if retry == 0:
+                logging.error("device file not exist: %s" % filename)
+                return False
+            time.sleep(0.001)
+            logging.debug("retry %d" % retry)
+
+            if rescan:
+                subprocess.call('echo 1 > /sys/bus/pci/rescan 2> /dev/null', shell=True)
+
+        return True
+
+    def _rescan(self):
         bdf = self._bdf.decode('utf-8')
 
         # rescan device without kernel nvme driver
@@ -693,28 +708,24 @@ cdef class Pcie(object):
         subprocess.call('echo 1 > /sys/bus/pci/rescan 2> /dev/null', shell=True)
 
         # check if the device is online
-        while not os.path.exists("/sys/bus/pci/devices/"+bdf):
-            retry -= 1
-            if retry == 0:
-                logging.error("device lost: %s, retry %d" % (bdf, retry))
-                return False
-            time.sleep(0.01)
-            logging.info("rescan the device: %s, retry %d" % (bdf, retry))
-            subprocess.call('echo 1 > /sys/bus/pci/rescan 2> /dev/null', shell=True)
-
-        logging.debug("find device on %s" % bdf)
-        return True
+        if self._exist("/sys/bus/pci/devices/"+bdf, True):
+            logging.debug("find device on %s" % bdf)
 
     def _bind_driver(self, driver):
         bdf = self._bdf.decode('utf-8')
         vdid = self._vdid.decode('utf-8')
 
-        if os.path.exists("/sys/bus/pci/devices/%s/driver" % bdf):
-            logging.debug("unbind %s on %s" % (vdid, bdf))
+        # check if the driver is ready
+        if self._exist("/sys/bus/pci/devices/%s/driver/remove_id" % bdf) and \
+           self._exist("/sys/bus/pci/devices/%s/driver/unbind" % bdf):
+            logging.debug("remove the device: %s" % bdf)
             subprocess.call('echo "%s" > "/sys/bus/pci/devices/%s/driver/remove_id" 2> /dev/null' % (vdid, bdf), shell=True)
             subprocess.call('echo "%s" > "/sys/bus/pci/devices/%s/driver/unbind" 2> /dev/null' % (bdf, bdf), shell=True)
 
-        if driver:
+        # bind the new driver
+        if driver and \
+           self._exist("/sys/bus/pci/drivers/%s/new_id" % driver) and \
+           self._exist("/sys/bus/pci/drivers/%s/bind" % driver):
             subprocess.call('echo "%s" > "/sys/bus/pci/drivers/%s/new_id" 2> /dev/null' % (vdid, driver), shell=True)
             subprocess.call('echo "%s" > "/sys/bus/pci/drivers/%s/bind" 2> /dev/null' % (bdf, driver), shell=True)
             logging.debug("bind %s on %s" % (driver, bdf))
@@ -941,7 +952,7 @@ cdef class Controller(object):
                 nvme0.identify(Buffer(4096)).waitdone()
                 if nvme0.init_ns() < 0:
                     # second try fail: error
-                    raise NvmeEnumerateError("init namespaces failed")
+                    raise NvmeEnumerateError("retry init namespaces failed")
 
             # 8. set/get num of queues
             logging.debug("init number of queues")
@@ -954,7 +965,15 @@ cdef class Controller(object):
 
     @property
     def latest_cid(self):
+        '''cid of latest completed command'''
+
         return d.qpair_get_latest_cid(NULL, self.pcie._ctrlr)
+
+    @property
+    def latest_latency(self):
+        '''latency of latest completed command in us'''
+
+        return d.qpair_get_latest_latency(NULL, self.pcie._ctrlr)
 
     @property
     def addr(self):
@@ -1151,9 +1170,10 @@ cdef class Controller(object):
         for i in range(_aer_resend):
             # send more aer commands
             self.aer(cb=self.aer_cb_func)
-        for i in range(_aer_waitdone):
-            # process one more command in lieu of aer completion
-            self.waitdone()
+        if _aer_waitdone >= reaped-expected:
+            for i in range(_aer_waitdone-(reaped-expected)):
+                # process one more command in lieu of aer completion
+                self.waitdone()
 
         return _latest_cqe_cdw0
 
@@ -1732,11 +1752,21 @@ cdef class Qpair(object):
 
     @property
     def sqid(self):
+        '''submission queue id in this qpair'''
+
         return d.qpair_get_id(self._qpair)
 
     @property
     def latest_cid(self):
+        '''cid of latest completed command'''
+
         return d.qpair_get_latest_cid(self._qpair, self._nvme.pcie._ctrlr)
+
+    @property
+    def latest_latency(self):
+        '''latency of latest completed command in us'''
+
+        return d.qpair_get_latest_latency(self._qpair, self._nvme.pcie._ctrlr)
 
     def cmdlog(self, count=0):
         """print recent IO commands and their completions in this qpair.
@@ -1957,7 +1987,7 @@ cdef class Namespace(object):
                  region_start=0, region_end=0xffffffffffffffff,
                  iops=0, io_count=0, lba_start=0, qprio=0,
                  distribution=None, ptype=0xbeef, pvalue=100,
-                 io_sequence=None, fw_debug=False, 
+                 io_sequence=None, fw_debug=False,
                  output_io_per_second=None,
                  output_percentile_latency=None,
                  output_cmdlog_list=None):
@@ -2063,7 +2093,7 @@ cdef class Namespace(object):
                          lba_start, lba_step, io_size,
                          lba_align, lba_random, region_start, region_end,
                          op_percentage, iops, io_count, time, qdepth, qprio,
-                         distribution, pvalue, ptype, io_sequence, fw_debug, 
+                         distribution, pvalue, ptype, io_sequence, fw_debug,
                          output_io_per_second,
                          output_percentile_latency,
                          output_cmdlog_list)
@@ -2309,22 +2339,22 @@ cdef class Namespace(object):
     def zns_mgmt_receive(self, qpair, buf, slba=0, dwords=None, extended=True, state=0, partial=True, cb=None):
         if dwords is None:  dwords = len(buf)>>2  # the same size of buffer
         assert dwords > 0, "cannot read empty data"
-        
+
         self.send_io_raw(qpair, buf, 0x7a, self._nsid,
                          slba&0xffffffff, slba>>32,
                          dwords-1,
-                         (partial<<16)+(state<<8)+extended, 0, 0, 
+                         (partial<<16)+(state<<8)+extended, 0, 0,
                          cmd_cb, <void*>cb)
         return qpair
-    
+
     def zns_mgmt_send(self, qpair, buf, slba=0, action=0, all=False, cb=None):
         self.send_io_raw(qpair, buf, 0x79, self._nsid,
                          slba&0xffffffff, slba>>32,
-                         0, 
-                         (all<<8)+action, 0, 0, 
+                         0,
+                         (all<<8)+action, 0, 0,
                          cmd_cb, <void*>cb)
         return qpair
-    
+
     def send_cmd(self, opcode, qpair, buf=None, nsid=1,
                  cdw10=0, cdw11=0, cdw12=0,
                  cdw13=0, cdw14=0, cdw15=0,
@@ -2400,7 +2430,7 @@ class _IOWorker(object):
                  lba_start, lba_step, lba_size,
                  lba_align, lba_random, region_start, region_end,
                  op_percentage, iops, io_count, time, qdepth, qprio,
-                 distribution, pvalue, ptype, io_sequence, fw_debug, 
+                 distribution, pvalue, ptype, io_sequence, fw_debug,
                  output_io_per_second,
                  output_percentile_latency,
                  output_cmdlog_list):
@@ -2418,7 +2448,7 @@ class _IOWorker(object):
                                      op_percentage,
                                      iops, io_count, time, qdepth, qprio,
                                      distribution, pvalue, ptype,
-                                     io_sequence, fw_debug, 
+                                     io_sequence, fw_debug,
                                      output_io_per_second,
                                      output_percentile_latency,
                                      output_cmdlog_list))
@@ -2562,7 +2592,7 @@ class _IOWorker(object):
                   lba_start, lba_step, lba_size, lba_align, lba_random,
                   region_start, region_end, op_percentage,
                   iops, io_count, seconds, qdepth, qprio,
-                  distribution, pvalue, ptype, io_sequence, fw_debug, 
+                  distribution, pvalue, ptype, io_sequence, fw_debug,
                   output_io_per_second,
                   output_percentile_latency,
                   output_cmdlog_list):
@@ -2750,9 +2780,10 @@ class _IOWorker(object):
 
             # sudden terminate, not block on the queue
             fast_exit = False
+            if error:
+                fast_exit = True
             if error == -7:
                 error = 0
-                fast_exit = True
 
             # feed return to main process
             rqueue.put((os.getpid(),
@@ -2769,11 +2800,13 @@ class _IOWorker(object):
 
             if not fw_debug or not error:
                 with locker:
+                    terminated = d.driver_config_read() & 0x10
+
                     # close resources in right order
                     if 'qpair' in locals():
                         # fail fast to delete queue after power loss
                         orig = nvme0.timeout
-                        if d.driver_config_read() & 0x10:
+                        if terminated:
                             nvme0.timeout = 10
                             # backup BAR and remap to another memory
                             d.nvme_bar_remap(nvme0.pcie._ctrlr)
@@ -2784,7 +2817,7 @@ class _IOWorker(object):
                             pass
 
                         # use original timeout
-                        if d.driver_config_read() & 0x10:
+                        if terminated:
                             nvme0.timeout = orig
                             # use original BAR
                             d.nvme_bar_recover(nvme0.pcie._ctrlr)

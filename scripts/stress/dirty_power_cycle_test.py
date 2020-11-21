@@ -40,6 +40,16 @@ import logging
 import nvme as d
 
 
+# limit verification space
+region_end = 256*1000*1000  # 1GB
+
+@pytest.fixture(scope="function")
+def nvme0n1(nvme0):
+    ret = d.Namespace(nvme0, 1, region_end)
+    yield ret
+    ret.close()
+
+
 def test_precondition_format(pcie, nvme0, nvme0n1, subsystem):
     pcie.reset()
     nvme0.reset()
@@ -48,8 +58,7 @@ def test_precondition_format(pcie, nvme0, nvme0n1, subsystem):
     nvme0n1.format(512)
     
 
-def test_quarch_dirty_power_cycle_single(nvme0, poweron=None, poweroff=None):
-    region_end = 256*1000*1000  # 1GB
+def test_quarch_dirty_power_cycle_single(nvme0, nvme0n1, poweron=None, poweroff=None):
     qdepth = min(1024, 1+(nvme0.cap&0xffff))
     
     # get the unsafe shutdown count
@@ -60,7 +69,6 @@ def test_quarch_dirty_power_cycle_single(nvme0, poweron=None, poweroff=None):
     
     # run the test one by one
     subsystem = d.Subsystem(nvme0, poweron, poweroff)
-    nvme0n1 = d.Namespace(nvme0, 1, region_end)
     assert True == nvme0n1.verify_enable(True)
     orig_unsafe_count = power_cycle_count()
     logging.info("power cycle count: %d" % orig_unsafe_count)
@@ -99,14 +107,13 @@ def test_quarch_dirty_power_cycle_single(nvme0, poweron=None, poweroff=None):
             #logging.info("verify slba 0x%x, nlba %d" % (slba, nlba))
             nvme0n1.read(qpair, read_buf, slba, nlba, cb=read_cb).waitdone()
             # re-write to clear CRC mismatch
-            nvme0n1.write(qpair, read_buf, slba, nlba, cb=read_cb).waitdone()
+            nvme0n1.write(qpair, read_buf, slba, nlba).waitdone()
     qpair.delete()
-    nvme0n1.close()
 
     # verify unsafe shutdown count
     unsafe_count = power_cycle_count()
     logging.info("power cycle count: %d" % unsafe_count)
-    assert unsafe_count == orig_unsafe_count+1
+    assert unsafe_count > orig_unsafe_count
 
     
 # define the power on/off funciton
@@ -139,12 +146,12 @@ class quarch_power:
         
 
 @pytest.mark.parametrize("repeat", range(10))
-def test_quarch_dirty_power_cycle_multiple(pciaddr, nvme0, repeat):
+def test_quarch_dirty_power_cycle_multiple(pciaddr, nvme0, nvme0n1, repeat):
     device_list = {
         "0000:06:00.0": # pynvme's software-defined power cycle
         (None,
          None),  
-        "0000:3d:00.0": # pynvme's software-defined power cycle
+        "0000:3a:00.0": # pynvme's software-defined power cycle
         (None,
          None),  
         "0000:08:00.0":
@@ -162,5 +169,5 @@ def test_quarch_dirty_power_cycle_multiple(pciaddr, nvme0, repeat):
     }
 
     poweron, poweroff = device_list[pciaddr]
-    test_quarch_dirty_power_cycle_single(nvme0, poweron, poweroff)
+    test_quarch_dirty_power_cycle_single(nvme0, nvme0n1, poweron, poweroff)
 
